@@ -16,9 +16,11 @@ local CFG = {
 	RUNTIME              = 900,   -- Sekunden, wird ENFORCED (Schleife + Warteschleife)
 	SCAN_INTERVAL        = 2,
 	MAX_OBJS             = 25000, -- traversierte Objekte je Scan; Grenze wird VOR Verarbeitung geprueft
-	BASELINE_PASSES      = 5,
-	BASELINE_MIN_MATCH   = 2,     -- aufeinanderfolgende identische Scans fuer "STABIL"
+	BASELINE_PASSES      = 3,
+	BASELINE_MIN_MATCH   = 2,     -- aufeinanderfolgende strukturell identische Scans fuer "STABIL"
 	BASELINE_WAIT        = 1,
+	BASELINE_MAX_WALL    = 60,    -- Sekunden Gesamt-Budget fuer die Baseline (dann letzten gueltigen Pass akzeptieren)
+	DIFF_JITTER_SUPPRESS = true,  -- reine pos/size-Aenderungen (Animationen) als Zaehler statt Listing
 	REQUIRE_STABLE_BASELINE = false, -- true = ohne stabile Baseline keine Diffs
 	PROBE_COOLDOWN       = 1.5,
 	MAX_WATCHERS         = 3000,  -- Verbindungen (2 je Textobjekt => ~1500 Textobjekte)
@@ -613,7 +615,14 @@ local function scanContainer(c, scan)
 						vis, visOk = pbool(obj, "Visible")
 						if not visOk then st.propErrs = st.propErrs + 1 end
 					end
-					local ev, why = effVisible(obj)
+					local ev, why
+					if isText then
+						ev, why = effVisible(obj) -- volle Kette nur bei Textobjekten (Hot Path)
+					elseif isSGobj then
+						ev, why = vis, "sg(vis=Enabled)"
+					else
+						ev, why = vis, "frame(vis-only)"
+					end
 					local path, pathTotal = chainOf(obj)
 					local sg = sgOf(obj)
 					local sgid, sgName, sgEn, sgDisp = 0, "-", nil, nil
@@ -751,7 +760,13 @@ local function classifyDiff(prevRows, curRows)
 			if parentPathOf(p.path) ~= parentPathOf(r.path) then
 				table.insert(f, "parent: " .. tostring(parentPathOf(p.path)) .. " -> " .. tostring(parentPathOf(r.path)))
 			end
-			if #f > 0 then table.insert(CHANGED, { row = r, fields = f }) end
+			if #f > 0 then
+				local jitter = true
+				for _, fld in ipairs(f) do
+					if string.sub(fld, 1, 5) ~= "pos: " and string.sub(fld, 1, 6) ~= "size: " then jitter = false; break end
+				end
+				table.insert(CHANGED, { row = r, fields = f, jitter = jitter })
+			end
 		end
 	end
 	for _, p in ipairs(prevRows) do
@@ -1031,7 +1046,7 @@ end
 -- Report-Bausteine
 -- ---------------------------------------------------------------
 local scanNo = 0
-local totals = { new = 0, changed = 0, removed = 0, scans = 0, validScans = 0, partial = 0, truncated = 0 }
+local totals = { new = 0, changed = 0, removed = 0, jitter = 0, scans = 0, validScans = 0, partial = 0, truncated = 0 }
 local diffSects = 0
 local prevRows = nil
 local baselineReady, baselineStable = false, false
@@ -1121,13 +1136,28 @@ local function writeDiffSection(scan, NEW, CHANGED, REMOVED)
 			if not budget(rowLines(r, "   ")) then cap = true; break end
 		end
 	end
-	if not cap and #CHANGED > 0 then
-		L[#L + 1] = "  -- CHANGED --"
+	if not cap then
+		-- Jitter trennen: reine pos/size-Aenderungen (Lobby-Animationen) als
+		-- Zaehler, strukturelle CHANGED (Text/Sichtbarkeit/z/SG/Parent) als Listing
+		local chStruct, jitterN = {}, 0
 		for _, ch in ipairs(CHANGED) do
-			local ls = {}
-			ls[#ls + 1] = string.format("   %s id=%d", ch.row.path, ch.row.id)
-			for _, f in ipairs(ch.fields) do ls[#ls + 1] = "     " .. f end
-			if not budget(ls) then cap = true; break end
+			if CFG.DIFF_JITTER_SUPPRESS and ch.jitter then jitterN = jitterN + 1
+			else table.insert(chStruct, ch) end
+		end
+		totals.jitter = totals.jitter + jitterN
+		if jitterN > 0 then
+			L[#L + 1] = string.format("  POSITIONEN-JITTER (nur pos/size, Animationen): %d unterdrueckt (CFG.DIFF_JITTER_SUPPRESS)", jitterN)
+			chars = chars + #L[#L + 1] + 1
+		end
+		if #chStruct > 0 then
+			L[#L + 1] = "  -- CHANGED (strukturell) --"
+			chars = chars + #L[#L + 1] + 1
+			for _, ch in ipairs(chStruct) do
+				local ls = {}
+				ls[#ls + 1] = string.format("   %s id=%d", ch.row.path, ch.row.id)
+				for _, f in ipairs(ch.fields) do ls[#ls + 1] = "     " .. f end
+				if not budget(ls) then cap = true; break end
+			end
 		end
 	end
 	if not cap and #REMOVED > 0 then
@@ -1149,7 +1179,14 @@ end
 local function runBaseline()
 	local stableCount = 0
 	local lastValid = nil
+	local baselineClock = os.clock()
 	for p = 1, CFG.BASELINE_PASSES do
+		-- Gesamt-Zeitbudget: Lobby-UI animiert permanent; ohne Limit laeuft
+		-- die Baseline sonst minutenlang und das Panel bleibt auf "starte..."
+		if os.clock() - baselineClock > CFG.BASELINE_MAX_WALL and lastValid ~= nil then
+			fileOut(string.format("[%s] BASELINE-Zeitlimit (%ds) — akzeptiere letzten gueltigen Pass.", nowStr(), CFG.BASELINE_MAX_WALL))
+			break
+		end
 		print("[PC99] Baseline " .. p .. "/" .. CFG.BASELINE_PASSES .. " ...")
 		local scan = fullScan("BASELINE" .. p)
 		totals.scans = totals.scans + 1
@@ -1162,19 +1199,32 @@ local function runBaseline()
 			stableCount = 1
 		else
 			local n, c, r = classifyDiff(lastValid.rows, scan.rows)
-			local nCh = #n + #c + #r
-			if nCh == 0 then
+			local jitterN = 0
+			for _, ch in ipairs(c) do if ch.jitter then jitterN = jitterN + 1 end end
+			local structural = #n + #r + (#c - jitterN)
+			if structural == 0 then
 				stableCount = stableCount + 1
-				fileOut(string.format("[%s] Baseline-Pass %d: IDENTISCH zu Pass %d (stable %d/%d)",
-					nowStr(), p, p - 1, stableCount, CFG.BASELINE_MIN_MATCH))
-				if stableCount >= CFG.BASELINE_MIN_MATCH then lastValid = scan; break end
+				if jitterN > 0 then
+					fileOut(string.format("[%s] Baseline-Pass %d: STRUKTURELL identisch zu Pass %d (stable %d/%d, %d Positions-Jitter von Animationen toleriert)",
+						nowStr(), p, p - 1, stableCount, CFG.BASELINE_MIN_MATCH, jitterN))
+				else
+					fileOut(string.format("[%s] Baseline-Pass %d: IDENTISCH zu Pass %d (stable %d/%d)",
+						nowStr(), p, p - 1, stableCount, CFG.BASELINE_MIN_MATCH))
+				end
 				lastValid = scan
+				if stableCount >= CFG.BASELINE_MIN_MATCH then break end
 			else
 				stableCount = 1
 				lastValid = scan
-				fileOut(string.format("[%s] Baseline-Pass %d: %d Aenderungen vs Vor-Pass — Stabilitaet reset (NEW=%d CH=%d REM=%d)",
-					nowStr(), p, nCh, #n, #c, #r))
+				fileOut(string.format("[%s] Baseline-Pass %d: %d STRUKTURELLE Aenderungen vs Vor-Pass — Stabilitaet reset (NEW=%d CH=%d(Jitter %d) REM=%d)",
+					nowStr(), p, structural, #n, #c, jitterN, #r))
 			end
+		end
+		if PANEL then
+			pcall(function()
+				PANEL.Box.Txt.Text = string.format("PC99 v7 | Baseline %d/%d  rows=%d  %dms\nstabil %d/%d | gesamt %.0fs — bitte warten",
+					p, CFG.BASELINE_PASSES, #scan.rows, scan.durMs, stableCount, CFG.BASELINE_MIN_MATCH, os.clock() - baselineClock)
+			end)
 		end
 		task.wait(CFG.BASELINE_WAIT)
 	end
@@ -1231,8 +1281,8 @@ local function summary()
 	fileOut("== ABSCHLUSS-REPORT " .. nowStr() .. " ==")
 	fileOut(string.format("Laufzeit: %.1fs (Limit %ds) | Scans total=%d valid=%d partial=%d truncated=%d | Datei: %s",
 		os.clock() - startClock, CFG.RUNTIME, totals.scans, totals.validScans, totals.partial, totals.truncated, filePath))
-	fileOut(string.format("Diffs: NEW=%d CHANGED=%d REMOVED=%d | Sektionen: %d (danach Kompaktmodus) | IO: writes=%d appends=%d wfErr=%d appendErr=%d dropped=%dB mirrorErr=%d mirrorDropped=%dB %s",
-		totals.new, totals.changed, totals.removed, diffSects,
+	fileOut(string.format("Diffs: NEW=%d CHANGED=%d REMOVED=%d jitterOnly=%d | Sektionen: %d (danach Kompaktmodus) | IO: writes=%d appends=%d wfErr=%d appendErr=%d dropped=%dB mirrorErr=%d mirrorDropped=%dB %s",
+		totals.new, totals.changed, totals.removed, totals.jitter, diffSects,
 		ioStat.writes, ioStat.appends, ioStat.wfErr, ioStat.appendErr, ioStat.dropped,
 		ioStat.mirrorErr, mirrorDropped,
 		ioStat.appendErrMsg ~= "" and ("(" .. ioStat.appendErrMsg .. ")") or ""))
@@ -1337,10 +1387,15 @@ end
 
 -- Ablauf ---------------------------------------------------------
 print("[PC99] DEEP-SCAN v7 startet. Datei: " .. filePath)
-execProbe()
-buildContainers()
-headerOut()
-bindRoots()
+
+-- Bootstrap in xpcall: ein Fehler beim Start ist jetzt SICHTBAR
+-- (Panel + Datei), statt dass das Script still stirbt und das
+-- Panel fuer immer auf "starte..." stehen bleibt.
+local function mainBootstrap()
+	execProbe()
+	buildContainers()
+	headerOut()
+	bindRoots()
 
 local lp = Players.LocalPlayer
 if not lp then
@@ -1362,14 +1417,30 @@ if not Players.LocalPlayer then
 	fileOut("WARNUNG: kein LocalPlayer nach 15s — PlayerGui NICHT im Scan.")
 end
 
-local baselineOk = runBaseline()
-if baselineOk and prevRows then dumpBaseline(prevRows) end
+	local baselineOk = runBaseline()
+	if baselineOk and prevRows then dumpBaseline(prevRows) end
 
-if PANEL then
-	pcall(function()
-		PANEL.Box.Txt.Text = "PC99 v7 | Baseline: " .. (baselineStable and "STABIL" or (baselineOk and "UNSTABIL" or "FEHLER")) ..
-			"\nJetzt Alt-Trade oeffnen (read-only Test)"
-	end)
+	if PANEL then
+		pcall(function()
+			PANEL.Box.Txt.Text = "PC99 v7 | Baseline: " .. (baselineStable and "STABIL" or (baselineOk and "UNSTABIL" or "FEHLER")) ..
+				"\nJetzt Alt-Trade oeffnen (read-only Test)"
+		end)
+	end
+end
+
+local okB, errB = xpcall(mainBootstrap, function(e)
+	if debug and type(debug.traceback) == "function" then return debug.traceback(tostring(e), 2) end
+	return tostring(e)
+end)
+if not okB then
+	fileOut("!! FEHLER beim Start (Bootstrap): " .. tostring(errB))
+	forceFlush()
+	print("[PC99] FEHLER beim Start: " .. tostring(errB))
+	if PANEL then
+		pcall(function()
+			PANEL.Box.Txt.Text = "PC99 v7 FEHLER beim Start:\n" .. tostring(errB)
+		end)
+	end
 end
 
 -- Notfall-Abschluss (Punkt 43): falls summary() SELBST fehlschlaegt,
